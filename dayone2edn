@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+r"""
+dayone2edn v0.1: convert a Day One JSON export into Logseq DB "Build EDN",
+for  Import -> "EDN to DB graph".
+
+    python3 dayone2edn.py ~/Downloads/Journal.json            # -> dayone.edn
+    python3 dayone2edn.py ~/Downloads/Journal.json -o my.edn
+    python3 dayone2edn.py ~/Downloads/Journal.json --plain    # omit export wrapper key
+
+Each Day One entry becomes a top-level block on its journal page, tagged #Diary,
+with its original created/updated timestamps. Body lines become child blocks.
+if it rejects the file, try --plain.
+
+change TZ_ALIASES in code to match your timezone you recorded diary
+  
+"""
+import argparse
+import json
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+DEFAULT_TITLE = "DayOne Entry"
+MAX_TITLE_LEN = 60
+TZ_ALIASES = {"Asia/Katmandu": "Asia/Kathmandu"}
+ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!&<>~|])")
+HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+class Kw(str):
+    """An EDN keyword (rendered with a leading colon)."""
+
+
+def edn(v):
+    if isinstance(v, Kw):
+        return ":" + v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        s = (v.replace("\\", "\\\\").replace('"', '\\"')
+              .replace("\r", "").replace("\n", "\\n").replace("\t", "\\t"))
+        return f'"{s}"'
+    if isinstance(v, (list, tuple)):
+        return "[" + " ".join(edn(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + " ".join(f"{edn(k)} {edn(x)}" for k, x in v.items()) + "}"
+    raise TypeError(f"cannot encode {type(v)}")
+
+
+def parse_utc(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def local_dt(entry, utc, use_utc):
+    if use_utc:
+        return utc
+    name = entry.get("timeZone") or "UTC"
+    name = TZ_ALIASES.get(name, name)
+    try:
+        return utc.astimezone(ZoneInfo(name))
+    except Exception:
+        return utc
+
+
+def clean_text(text):
+    text = text.replace("\r\n", "\n")
+    text = BR_RE.sub("", text)
+    text = ESCAPE_RE.sub(r"\1", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text.strip()
+
+
+def split_title_body(text):
+    lines = text.split("\n")
+    first = lines[0].strip()
+    rest = "\n".join(lines[1:]).strip()
+    m = HEADING_RE.match(first)
+    if m:
+        return (m.group(1).strip() or DEFAULT_TITLE), rest
+    if first and len(first) <= MAX_TITLE_LEN:
+        return first, rest
+    return DEFAULT_TITLE, text
+
+
+def tag_kw(tag):
+    name = re.sub(r"[^\w\-]+", "-", tag.strip()).strip("-")
+    return Kw(name[:1].upper() + name[1:]) if name else None
+
+
+def format_location(loc):
+    parts = [loc[k] for k in ("placeName", "localityName", "administrativeArea", "country")
+             if loc.get(k)]
+    out = ", ".join(parts)
+    if "latitude" in loc and "longitude" in loc:
+        coords = f"lat: {loc['latitude']}, long: {loc['longitude']}"
+        out = f"{out} ({coords})" if out else coords
+    return out
+
+
+def build_block(entry, utc, paragraphs, classes, warn):
+    text = re.sub(r"!\[\]\(dayone-moment://[^)]*\)", "", entry.get("text") or "")
+    text = clean_text(text)
+    if entry.get("photos"):
+        warn["photos"] += 1
+    if not text:
+        return None
+
+    title, body = split_title_body(text)
+    created = int(utc.timestamp() * 1000)
+    try:
+        updated = int(parse_utc(entry["modifiedDate"]).timestamp() * 1000)
+    except Exception:
+        updated = created
+    stamps = {Kw("block/created-at"): created, Kw("block/updated-at"): updated}
+
+    tags = [Kw("Diary")]
+    for t in entry.get("tags") or []:
+        k = tag_kw(t)
+        if k and k not in tags:
+            tags.append(k)
+            classes[k] = {}
+
+    if paragraphs:
+        parts = [" ".join(p.split("\n")) if False else "\n".join(l.strip() for l in p.split("\n") if l.strip())
+                 for p in re.split(r"\n\s*\n", body)]
+    else:
+        parts = [l.strip() for l in body.split("\n")]
+    children = [{Kw("block/title"): p, **stamps} for p in parts if p]
+
+    if entry.get("location"):
+        loc = format_location(entry["location"])
+        if loc:
+            children.append({Kw("block/title"): f"Location: {loc}", **stamps})
+
+    block = {Kw("block/title"): title, **stamps, Kw("build/tags"): tags}
+    if children:
+        block[Kw("build/children")] = children
+    return block
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Day One JSON -> Logseq DB Build EDN")
+    ap.add_argument("journal")
+    ap.add_argument("-o", "--output", default="dayone.edn")
+    ap.add_argument("--utc", action="store_true", help="Use UTC dates instead of each entry's timezone")
+    ap.add_argument("--paragraphs", action="store_true", help="One block per paragraph instead of per line")
+    ap.add_argument("--plain", action="store_true", help="Omit the export-type wrapper key")
+    opts = ap.parse_args()
+
+    with open(Path(opts.journal).expanduser(), encoding="utf-8") as fp:
+        journal = json.load(fp)
+
+    classes = {Kw("Diary"): {}}
+    warn = {"photos": 0}
+    days = defaultdict(list)            # yyyymmdd int -> [(utc, block)]
+    skipped = 0
+    for entry in journal.get("entries", []):
+        try:
+            utc = parse_utc(entry["creationDate"])
+        except (KeyError, ValueError):
+            skipped += 1
+            continue
+        block = build_block(entry, utc, opts.paragraphs, classes, warn)
+        if block is None:
+            skipped += 1
+            continue
+        d = local_dt(entry, utc, opts.utc)
+        days[int(d.strftime("%Y%m%d"))].append((utc, block))
+
+    pages = []
+    for day in sorted(days):
+        blocks = [b for _, b in sorted(days[day], key=lambda x: x[0])]
+        pages.append("{:page " + edn({Kw("build/journal"): day}) + " :blocks " + edn(blocks) + "}")
+
+    head = "" if opts.plain else ":logseq.db.sqlite.export/export-type :graph\n "
+    out = ("{" + head + ":properties {}\n :classes " + edn(classes) +
+           "\n :pages-and-blocks [\n" + "\n".join(pages) + "]}\n")
+    Path(opts.output).expanduser().write_text(out, encoding="utf-8")
+
+    n = sum(len(v) for v in days.values())
+    print(f"Wrote {opts.output}: {len(pages)} journal days, {n} entries, {skipped} skipped.")
+    if warn["photos"]:
+        print(f"Note: {warn['photos']} entries have photos; photos are not included in EDN output.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
